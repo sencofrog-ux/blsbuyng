@@ -1,0 +1,691 @@
+<html lang="ko"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures (htmlToImage undefined) and toPng errors
+            // so the parent always gets a response instead of hanging forever.
+            try {
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WO Analyzer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap');
+:root{--bg:#0a0c10;--s1:#11141c;--s2:#181c27;--s3:#1f2436;--border:#262d40;--border2:#2e3650;--acc:#5b8af0;--acc2:#42d9a8;--acc3:#f5c842;--acc4:#e05c5c;--txt:#e8edf8;--txt2:#8b96bc;--txt3:#4a5270;--grad:linear-gradient(135deg,#5b8af0,#8b5cf6)}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--txt);font-family:'Noto Sans KR',sans-serif;min-height:100vh}
+.header{padding:18px 28px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px}
+.logo{font-family:'Syne',sans-serif;font-size:20px;font-weight:800;background:var(--grad);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo-sub{font-size:11px;color:var(--txt3);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.header-right{margin-left:auto;display:flex;align-items:center;gap:8px}
+.badge{padding:4px 12px;border-radius:20px;font-size:11px;font-weight:700;background:rgba(91,138,240,.12);color:var(--acc);border:1px solid rgba(91,138,240,.25)}
+.btn-sm{padding:6px 12px;border-radius:7px;border:1.5px solid rgba(66,217,168,.4);background:rgba(66,217,168,.1);color:var(--acc2);font-size:11px;font-weight:700;cursor:pointer;font-family:'Noto Sans KR',sans-serif}
+.btn-sm:hover{background:rgba(66,217,168,.2)}
+.layout{display:grid;grid-template-columns:300px 1fr;height:calc(100vh - 61px)}
+.side{background:var(--s1);border-right:1px solid var(--border);padding:18px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.main{padding:20px;overflow-y:auto}
+/* 탭 */
+.tab-row{display:flex;gap:4px;background:var(--s2);border-radius:10px;padding:4px;margin-bottom:14px}
+.tab{flex:1;padding:8px;text-align:center;border-radius:7px;cursor:pointer;font-size:12px;font-weight:700;color:var(--txt2);transition:all .2s}
+.tab.on{background:var(--acc);color:#fff}
+.tab.on-new{background:var(--acc2);color:#0a0c10}
+/* 섹션 */
+.sec{font-size:10px;font-weight:700;color:var(--txt3);text-transform:uppercase;letter-spacing:1.5px;margin-bottom:8px;display:flex;align-items:center;gap:8px}
+.sec::after{content:'';flex:1;height:1px;background:var(--border)}
+/* 드롭존 */
+.drop-zone{border:2px dashed var(--border2);border-radius:12px;padding:20px 14px;text-align:center;cursor:pointer;transition:all .2s;position:relative;background:var(--s2)}
+.drop-zone:hover,.drop-zone.drag{border-color:var(--acc);background:rgba(91,138,240,.06)}
+.drop-zone.new-zone:hover,.drop-zone.new-zone.drag{border-color:var(--acc2)}
+.drop-zone input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%}
+.drop-icon{font-size:24px;margin-bottom:5px}
+.drop-title{font-size:12px;font-weight:700;margin-bottom:2px}
+.drop-sub{font-size:10px;color:var(--txt3)}
+.prog-wrap{height:3px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:8px}
+.prog-fill{height:100%;background:var(--grad);border-radius:2px;transition:width .3s;width:0}
+/* 상태 */
+.status{padding:8px 12px;border-radius:8px;font-size:11px;font-weight:600;display:none;margin-top:8px;align-items:center;gap:7px}
+.status.show{display:flex}
+.status.ok{background:rgba(66,217,168,.1);color:var(--acc2);border:1px solid rgba(66,217,168,.2)}
+.status.err{background:rgba(224,92,92,.1);color:var(--acc4);border:1px solid rgba(224,92,92,.2)}
+.status.loading{background:rgba(91,138,240,.1);color:var(--acc);border:1px solid rgba(91,138,240,.2)}
+.spin{width:12px;height:12px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* 파일 목록 */
+.file-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
+.file-item{display:flex;align-items:center;gap:7px;padding:6px 9px;border-radius:6px;background:var(--s2);border:1px solid var(--border);font-size:10px}
+.fi-name{flex:1;font-family:'JetBrains Mono',monospace;color:var(--txt2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fi-ok{color:var(--acc2)}.fi-err{color:var(--acc4)}.fi-ing{color:var(--acc)}
+/* 다운로드 바 */
+.dl-bar{display:none;padding:10px 14px;background:rgba(66,217,168,.06);border:1px solid rgba(66,217,168,.2);border-radius:10px;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.dl-bar.show{display:flex}
+.dl-info{font-size:12px;color:var(--acc2);font-weight:600;flex:1}
+.dl-info span{color:var(--txt2);font-weight:400}
+.btn-dl{padding:7px 14px;border-radius:8px;border:none;cursor:pointer;font-size:11px;font-weight:700;font-family:'Noto Sans KR',sans-serif;transition:all .15s}
+.btn-dl-past{background:var(--acc);color:#fff}
+.btn-dl-new{background:var(--acc2);color:#0a0c10}
+.btn-dl:disabled{background:var(--s3);color:var(--txt3);cursor:not-allowed}
+/* 테이블 */
+.tbl-wrap{background:var(--s1);border:1px solid var(--border);border-radius:12px;overflow:auto}
+.tbl{width:100%;border-collapse:collapse;min-width:900px;font-size:11px}
+.tbl th{background:rgba(91,138,240,.15);color:var(--acc);padding:8px 10px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;border-bottom:1px solid var(--border);white-space:nowrap}
+.tbl td{padding:7px 10px;border-bottom:1px solid var(--border);color:var(--txt);vertical-align:middle}
+.tbl tr:hover td{background:var(--s2)}
+.tbl .mono{font-family:'JetBrains Mono',monospace;color:var(--acc);font-size:10px}
+.tbl .sm{font-size:10px;color:var(--txt2)}
+.tbl td[contenteditable]:focus{background:rgba(91,138,240,.1);outline:none}
+.tag-new{display:inline-block;padding:2px 6px;border-radius:4px;background:rgba(66,217,168,.15);color:var(--acc2);font-size:9px;font-weight:700;margin-left:4px}
+/* 섹션 헤더 */
+.sect-title{font-family:'Syne',sans-serif;font-size:13px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.pb{padding:3px 10px;border-radius:5px;font-size:10px;font-weight:700}
+.pb-blue{background:rgba(91,138,240,.15);color:var(--acc)}
+.pb-green{background:rgba(66,217,168,.15);color:var(--acc2)}
+/* 빈 상태 */
+.empty{text-align:center;padding:50px 20px;color:var(--txt3)}
+.empty-icon{font-size:32px;margin-bottom:10px}
+/* 스크롤 */
+::-webkit-scrollbar{width:4px;height:4px}::-webkit-scrollbar-track{background:var(--s2)}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+</style>
+
+<script id="__sd__">window.__PAST__=[{"sid":"14530-010-603-10","name":"B)C/P/SP HOOD DETACHABLE DENIM TRUCKER","season":"FALL","item":"자켓/점퍼","gender":"남성","material":"DENIM","fit":"레귤러","design1":"후드탈착","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-020-601-21","name":"COTTON POLY OXFORD SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-020-602-10","name":"B) C/P/SP DENIM SHIRKET","season":"FALL","item":"셔츠","gender":"남성","material":"DENIM","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-020-603-09","name":"COTTON CHECK SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"체크","memo":"","type":"past"},{"sid":"14530-020-604-09","name":"COTTON CHECK SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"체크","memo":"","type":"past"},{"sid":"14530-020-605-09","name":"COTTON PRINTING CHECK SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"체크","design2":"포켓","graphic":"체크","memo":"","type":"past"},{"sid":"14530-020-606-68","name":"SEERSUCKER CHECK SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"체크","memo":"","type":"past"},{"sid":"14530-031-601-07","name":"DOUBLE FACE SMALL BENNY BOLD STRIPE COLLAR T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"KNIT","fit":"레귤러","design1":"자수","design2":"버튼","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-031-603-31","name":"B) PCSP SMALL LETTER SINGLE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"JERSEY","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-031-604-07","name":"C/P NUMBER BIG GRAPHIC T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"COTTON","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-031-607-31","name":"CP HALFTONE DOTS PRINT T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"COTTON","fit":"오버핏","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-031-608-31","name":"DOUBLE FACE BASIC MTM","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"없음","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-031-609-31","name":"C/P MULTI STRIPE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"없음","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-031-611-31","name":"B) P/C/SP SOLID SHORT SLEEVE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"JERSEY","fit":"오버핏","design1":"없음","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-031-612-31","name":"B) P/C/SP BIG GRAPHIC SHORT SLEEVE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"JERSEY","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-031-613-15","name":"C/P MULTI STRIPE SHORT SLEEVE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"COTTON","fit":"레귤러","design1":"자수","design2":"배색","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-031-614-31","name":"B) C/P DOUBLE FACE 3COL YARN DYDE COLLAR TEE","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"버튼","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-031-615-15","name":"C/P MULTI STRIPE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"JERSEY","fit":"레귤러","design1":"배색","design2":"자수","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-031-616-07","name":"B) DOUBLE FACE CAMOUFLAGE GRAPHIC MTM","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-031-617-15","name":"COTTON SMALL LOGO MULTI STRIPE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"COTTON","fit":"레귤러","design1":"프린트","design2":"배색","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-031-651-07","name":"B) DOUBLE FACE BENNY MTM","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-031-652-07","name":"DOUBLE FACE HGTN BIG LOGO MTM","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"프린트","design2":"배색","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-031-653-07","name":"DOUBLE FACE SMALL BENNY HOODY","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"자수","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-034-601-07","name":"DOUBLE FACE BASIC HOOD ZIP-UP","season":"FALL","item":"집업","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"집업","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-037-601-07","name":"B) DOUBLE FACE 7L BERMUDA TUCK PANTS","season":"FALL","item":"숏팬츠","gender":"남성","material":"KNIT","fit":"레귤러","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-037-602-07","name":"DOUBLE FACE 6L CARGO BERMUDA PANTS","season":"FALL","item":"숏팬츠","gender":"남성","material":"KNIT","fit":"레귤러","design1":"포켓","design2":"벨크로","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-604-07","name":"DOUBLE FACE CARGO WIDE PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"WOVEN","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-605-41","name":"NYLON SPAN CARGO JOGGER PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"NYLON","fit":"레귤러","design1":"포켓","design2":"프린트","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-606-41","name":"NYLON SPAN CARGO WIDE PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"NYLON","fit":"와이드","design1":"포켓","design2":"프린트","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-651-07","name":"DOUBLE FACE JOGGER PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"FLEECE","fit":"레귤러","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-652-07","name":"DOUBLE FACE CARGO JOGGER PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"KNIT","fit":"레귤러","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-653-07","name":"DOUBLE FACE SEMI-WIDE PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"KNIT","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-601-31","name":"P/C/SPAN CARGO JOGGER PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"WOVEN","fit":"레귤러","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-602-07","name":"DOUBLE FACE ONE TUCK WIDE PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"KNIT","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-038-603-31","name":"B) P/C/SP STRAIGHT PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"WOVEN","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-050-601-09","name":"COTTON FULL BANDING CAMOUFLAGE CARGO WIDE PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"COTTON","fit":"와이드","design1":"포켓","design2":"프린트","graphic":"카모","memo":"","type":"past"},{"sid":"14530-050-602-09","name":"CAMOUFLAGE CARGO BERMUDA PANTS","season":"FALL","item":"팬츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"포켓","design2":"프린트","graphic":"카모","memo":"","type":"past"},{"sid":"14530-055-601-10","name":"B) C/P/SP FULL BANDING SEMI WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"남성","material":"DENIM","fit":"와이드","design1":"밴딩","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-055-602-10","name":"C/P/SP FULL BANDING COMFORT DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"남성","material":"DENIM","fit":"레귤러","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-055-603-10","name":"C/P/SP OPEN CARPENTER WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"남성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-055-604-10","name":"C/P/SP FULL BANDING CARGO WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"남성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-055-605-10","name":"C/P/SP FULL BANDING TAPERED DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"남성","material":"DENIM","fit":"레귤러","design1":"밴딩","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-055-606-10","name":"C/P/SP FULL BANDING BALLOON DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"남성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-056-602-10","name":"B) C/SP FULL BANDING 6L BERMUDA DENIM PANTS","season":"FALL","item":"데님숏팬츠","gender":"남성","material":"DENIM","fit":"레귤러","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-110-601-46","name":"G) P/SP TRACK TOP","season":"FALL","item":"자켓/점퍼","gender":"여성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"자수","graphic":"없음","memo":"","type":"past"},{"sid":"14530-110-602-05","name":"G)NYLON GOLSSY HALF NECK JUMPER","season":"FALL","item":"자켓/점퍼","gender":"여성","material":"NYLON","fit":"레귤러","design1":"집업","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-120-601-21","name":"G) CP OXFORD SHIRTS","season":"FALL","item":"셔츠","gender":"여성","material":"WOVEN","fit":"레귤러","design1":"자수","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-120-602-10","name":"G) C/P/SP DENIM SHIRKET","season":"FALL","item":"셔츠","gender":"여성","material":"DENIM","fit":"레귤러","design1":"포켓","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-120-603-09","name":"G) CHECK HOOD SHIRKET","season":"FALL","item":"셔츠","gender":"여성","material":"COTTON","fit":"레귤러","design1":"후드","design2":"체크","graphic":"체크","memo":"","type":"past"},{"sid":"14530-120-604-09","name":"G) T/R CHECK HOOD SHIRKET","season":"FALL","item":"셔츠","gender":"여성","material":"WOVEN","fit":"레귤러","design1":"후드탈착","design2":"버튼","graphic":"체크","memo":"","type":"past"},{"sid":"14530-120-606-09","name":"G)COTTON CHECK SHIRTS","season":"FALL","item":"셔츠","gender":"여성","material":"COTTON","fit":"레귤러","design1":"버튼","design2":"없음","graphic":"체크","memo":"","type":"past"},{"sid":"14530-120-641-45","name":"CHECK SHIRT","season":"FALL","item":"셔츠","gender":"여성","material":"WOVEN","fit":"레귤러","design1":"버튼","design2":"없음","graphic":"체크","memo":"","type":"past"},{"sid":"14530-120-642-45","name":"G) STRIPE SHIRT","season":"FALL","item":"셔츠","gender":"여성","material":"WOVEN","fit":"레귤러","design1":"버튼","design2":"없음","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-601-07","name":"G) DOUBLE FACE FRONT BIG LETTERING FLOCKING YOKO V-NECK MTM","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"FLEECE","fit":"레귤러","design1":"프린트","design2":"배색","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-131-603-31","name":"G) CP FRONT BIG LETTERING LONG SLEEVE T-SHIRT","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"COTTON","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-131-604-31","name":"G) PCSPAN BENNY LONG SLEEVE T-SHIRT","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"JERSEY","fit":"레귤러","design1":"자수","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-131-606-15","name":"G) T/R/SP WALE STRIPE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"없음","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-607-15","name":"G) T/R/SP WALE HENLEY NECK LAYERED T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"버튼","design2":"배색","graphic":"없음","memo":"","type":"past"},{"sid":"14530-131-611-05","name":"G) T/R/SP 71/22/7 280G LAYERED CADIGAN","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"버튼","design2":"배색","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-612-05","name":"G) T/R/SP WALE NENLEY NECK T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"버튼","design2":"자수","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-613-05","name":"G) WALE LAYERED T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"버튼","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-618-05","name":"G) WALE HENLEY NECK SNAP HOOD","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"스냅","design2":"포켓","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-619-05","name":"WALE STRIPE LAYERED CADIGAN","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"버튼","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-620-05","name":"G) KNIT LIKE HENLEY NECK SNAP HOOD","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"KNIT","fit":"레귤러","design1":"스냅","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-131-642-31","name":"STRIPE LAYERED T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"COTTON","fit":"레귤러","design1":"버튼","design2":"배색","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-131-652-07","name":"G) DOUBLE FACE FRONT BENNY SERIES MTM","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"FLEECE","fit":"레귤러","design1":"프린트","design2":"배색","graphic":"그래픽","memo":"","type":"past"},{"sid":"14530-131-653-31","name":"G) P/C/SP FRONT SMALL LETTERING LAYERED BUSTIER T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"여성","material":"JERSEY","fit":"레귤러","design1":"프린트","design2":"버튼","graphic":"없음","memo":"","type":"past"},{"sid":"14530-134-601-31","name":"G) KNIT LIKE HOOD ZIP UP","season":"FALL","item":"집업","gender":"여성","material":"KNIT","fit":"레귤러","design1":"집업","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-134-602-31","name":"G) COTTON /SPAN STRIPE HOOD ZIP UP","season":"FALL","item":"집업","gender":"여성","material":"COTTON","fit":"레귤러","design1":"집업","design2":"포켓","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-134-603-31","name":"G) KNIT LIKE STRIPE HOOD ZIP UP","season":"FALL","item":"집업","gender":"여성","material":"KNIT","fit":"레귤러","design1":"집업","design2":"포켓","graphic":"스트라이프","memo":"","type":"past"},{"sid":"14530-138-601-07(1)","name":"G) DOUBLE FACE JERSEY WIDE JOGGER PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"JERSEY","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-138-602-07","name":"G) DOUBLE FACE JERSEY ONE TUCK WIDE PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"JERSEY","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-138-603-07(2)","name":"DOUBLE FACE JERSEY SIDE TUCK WIDE PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"JERSEY","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-138-604-46","name":"G) P/SP TRACK WIDE PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"JERSEY","fit":"와이드","design1":"배색","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-138-605-07","name":"G) P/C DOUBLE FACE WIDE PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"KNIT","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-138-652-07","name":"G) DOUBLE FACE JERSEY SEMI-WIDE PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"JERSEY","fit":"와이드","design1":"포켓","design2":"없음","graphic":"없음","memo":"","type":"past"},{"sid":"14530-138-653-31","name":"P/C/SPAN JERSEY WIDE PANTS","season":"FALL","item":"팬츠","gender":"여성","material":"JERSEY","fit":"와이드","design1":"포켓","design2":"스트링","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-601-10","name":"C/P/SP FULL BANDING SEMI WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-602-10","name":"G) C/P/SP FULL BANDING STRAIGHT DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"레귤러","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-603-10","name":"C/P/SP FULL BANDING WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-604-10","name":"G) C/P/SP OPEN WAIST SIDE TUCK TRANSFORM WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-605-10","name":"C/P/SP FULL BANDING CARGO WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-606-10","name":"G) C/P/SP FULL BANDING CUTTING LINE WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-607-10","name":"C/P/SP FRONT TUCK BOTTOM SNAP TRANSFORM WIDE DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"스냅","design2":"포켓","graphic":"없음","memo":"","type":"past"},{"sid":"14530-155-608-10","name":"C/P/SP FULL BANDING BALLOON DENIM PANTS","season":"FALL","item":"데님팬츠","gender":"여성","material":"DENIM","fit":"와이드","design1":"포켓","design2":"스냅","graphic":"없음","memo":"","type":"past"}];window.__NEW__=[{"sid":"14580-020-601-09","name":"B)COTTON CHECK SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"COTTON","fit":"레귤러","design1":"포켓","design2":"없음","graphic":"체크","memo":"C100 150G 3COLOR CHECK YARN DYED SOFT WASHING, 인터라이닝(칼라/커프스/프론트오픈/포켓), 컬러2종(NAVY 097 / BROWN 185), 140SIZE 기준, SAME AS 14530-020-603-09 QUALITY","type":"new"},{"sid":"14580-020-602-10","name":"B)W. WASHED DENIM SHIRTS","season":"FALL","item":"셔츠","gender":"남성","material":"DENIM","fit":"레귤러","design1":"포켓","design2":"스냅","graphic":"없음","memo":"후드 삭제(05/27 업데이트), BIO STONE(SOFT)/SAND(BRUSH) 워싱, 인디고(SF4505 C/P/SP 91/7/2 9.3oz) 및 블랙(SF4473 C/P/R/SP 57/29/12/2 9oz) 2가지 원단, 140사이즈 기준","type":"new"},{"sid":"14580-031-601-31","name":"B)K. PIGMENT GRAPHIC T-SHIRT","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"COTTON","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"그래픽","memo":"GARMENT OVER DYE + ACID WASH / ANTI-PILLING / 넥 바인딩 1.8cm 2*1 LYCRA RIB DOUBLE SPAN RIB / 14570-031-428-31과 워싱기법 동일 적용","type":"new"},{"sid":"14580-031-602-31","name":"B) K. COTTON GRAPHIC T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"COTTON","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"로고","memo":"C 100% 180G ANTI-PILLING ANTI-PILLING(MELANGE), DOUBLE CHAIN ST, NECK BODY FABRIC 18MM 2FOLD, HIGH DENSITY PRINT(1C), 3color(O/WHITE/BROWN/BLACK), SAME AS QUALITY: 14570-031-439-31","type":"new"},{"sid":"14580-031-603-31","name":"B)K. STRIPE T-SHIRTS","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"KNIT","fit":"레귤러","design1":"배색","design2":"없음","graphic":"스트라이프","memo":"SAME AS STYLE: 14570-031-429-31 / 넥: 1x1 SPAN RIB 300G ANTI-PILLING / 숄더 TPU 5mm 테이프 / 백넥 10mm 바인딩 / 밑단 20mm 더블 체인스티치 / 컬러웨이: IVORY(025), S/BLUE(273)","type":"new"},{"sid":"14580-031-604-31","name":"B)K.P/C/SP BENNY RUBBER WAPPEN T-SHIRT","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"P/C/SP","fit":"레귤러","design1":"프린트","design2":"없음","graphic":"캐릭터","memo":"투명 러버 와펜 부착, 55/42/3 200G ANTI-PILLING(MELANGE) 소재, 4컬러(O/WHITE/BLUE/D.GRAY/BLACK), 26FW 시즌","type":"new"},{"sid":"14580-031-605-09","name":"B) K.C/P DOUBLE FACE 3COL YARN DYDE COLLAR TEE","season":"FALL","item":"티셔츠/후드티/맨투맨","gender":"남성","material":"D.FACE","fit":"레귤러","design1":"배색","design2":"프린트","graphic":"텍스트","memo":"DOUBLE FACE C/P 80/20 210G ANTI-PILLING / 3COL YARN DYED STRIPE / RUBBER PRINT 1C / 2*1 SPAN RIB CUFF / HERRINGBONE TAPE 내부 / 컬러: NAVY(097), GREEN(319)","type":"new"}];</script>
+</head>
+<body id="artifacts-component-root-html">
+<div class="header">
+  <div><div class="logo">WO Analyzer</div><div class="logo-sub">작업지시서 PDF → 스타일DB 자동 입력</div></div>
+  <div class="header-right">
+    <div class="badge" id="pastBadge">과거 85개</div>
+    <div class="badge" id="newBadge" style="background:rgba(66,217,168,.1);color:var(--acc2);border-color:rgba(66,217,168,.25)">신규 7개</div>
+    <button class="btn-sm" onclick="saveHtmlFile()">💾 파일 저장</button>
+  </div>
+</div>
+<div class="layout">
+  <!-- 사이드바 -->
+  <div class="side">
+    <div class="tab-row">
+      <div class="tab" id="tabPast" onclick="switchTab('past')">📁 과거 스타일</div>
+      <div class="tab on-new" id="tabNew" onclick="switchTab('new')">🆕 신규 스타일</div>
+    </div>
+    <!-- 과거 탭 -->
+    <div id="panePast" style="display: none;">
+      <div class="sec">과거 WO 업로드</div>
+      <div class="drop-zone" id="dropPast" ondragover="event.preventDefault();document.getElementById('dropPast').classList.add('drag')" ondragleave="document.getElementById('dropPast').classList.remove('drag')" ondrop="handleDrop(event,'past')">
+        <input type="file" accept=".pdf" multiple="" onchange="handleFiles(this.files,'past')">
+        <div class="drop-icon">📂</div>
+        <div class="drop-title">과거 WO PDF 업로드</div>
+        <div class="drop-sub">여러 파일 동시 선택 가능</div>
+      </div>
+      <div class="prog-wrap"><div class="prog-fill" id="progPast"></div></div>
+      <div class="status show ok" id="stPast">💾 과거 DB 복원 완료 · 85개</div>
+      <div style="margin-top:12px">
+        <div class="sec">등록 파일 <span id="cntPastFiles" style="color:var(--acc2);font-family:'JetBrains Mono',monospace;font-size:11px"></span></div>
+        <div class="file-list" id="listPast"><div style="font-size:11px;color:var(--txt3);padding:8px;text-align:center">없음</div></div>
+      </div>
+    </div>
+    <!-- 신규 탭 -->
+    <div id="paneNew" style="">
+      <div class="sec">신규 WO 업로드</div>
+      <div class="drop-zone new-zone" id="dropNew" ondragover="event.preventDefault();document.getElementById('dropNew').classList.add('drag')" ondragleave="document.getElementById('dropNew').classList.remove('drag')" ondrop="handleDrop(event,'new')">
+        <input type="file" accept=".pdf" multiple="" onchange="handleFiles(this.files,'new')">
+        <div class="drop-icon">🆕</div>
+        <div class="drop-title">신규 WO PDF 업로드</div>
+        <div class="drop-sub">여러 파일 동시 선택 가능</div>
+      </div>
+      <div class="prog-wrap"><div class="prog-fill" id="progNew" style="width: 0%;"></div></div>
+      <div class="status show ok" id="stNew">✅ 5개 완료</div>
+      <div style="margin-top:12px">
+        <div class="sec">등록 파일 <span id="cntNewFiles" style="color:var(--acc2);font-family:'JetBrains Mono',monospace;font-size:11px">7개</span></div>
+        <div class="file-list" id="listNew"><div class="file-item" id="fi-new-14580-020-601-09_남아_선염체크_카라_셔츠_pdf"><div class="fi-name" title="14580-020-601-09 남아 선염체크 카라 셔츠.pdf">14580-020-601-09 남아 선염체크 카라 셔츠.pdf</div><span class="fi-ok">완료</span></div><div class="file-item" id="fi-new-14580-020-602-10_남아_데님_셔츠_pdf"><div class="fi-name" title="14580-020-602-10 남아 데님 셔츠.pdf">14580-020-602-10 남아 데님 셔츠.pdf</div><span class="fi-ok">완료</span></div><div class="file-item" id="fi-new-14580-031-601-31_남아_피그먼트_그래픽티셔츠(추가)_pdf"><div class="fi-name" title="14580-031-601-31 남아 피그먼트 그래픽티셔츠(추가).pdf">14580-031-601-31 남아 피그먼트 그래픽티셔츠(추가).pdf</div><span class="fi-ok">완료</span></div><div class="file-item" id="fi-new-14580-031-602-31_남아_하이덴_로고_그래픽티셔츠_pdf"><div class="fi-name" title="14580-031-602-31 남아 하이덴 로고 그래픽티셔츠.pdf">14580-031-602-31 남아 하이덴 로고 그래픽티셔츠.pdf</div><span class="fi-ok">완료</span></div><div class="file-item" id="fi-new-14580-031-603-31_남아_멀티_스트라이프_반팔_티셔츠_pdf"><div class="fi-name" title="14580-031-603-31 남아 멀티 스트라이프 반팔 티셔츠.pdf">14580-031-603-31 남아 멀티 스트라이프 반팔 티셔츠.pdf</div><span class="fi-ok">완료</span></div><div class="file-item" id="fi-new-14580-031-604-31_남아_투명고무와펜_긴팔_티셔츠_pdf"><div class="fi-name" title="14580-031-604-31_남아 투명고무와펜 긴팔 티셔츠.pdf">14580-031-604-31_남아 투명고무와펜 긴팔 티셔츠.pdf</div><span class="fi-ok">완료</span></div><div class="file-item" id="fi-new-14580-031-605-09_남아_스트라이프_럭비_티셔츠_pdf"><div class="fi-name" title="14580-031-605-09_남아 스트라이프 럭비 티셔츠.pdf">14580-031-605-09_남아 스트라이프 럭비 티셔츠.pdf</div><span class="fi-ok">완료</span></div></div>
+      </div>
+    </div>
+    <button onclick="clearAll()" style="margin-top:auto;padding:8px;border-radius:8px;border:1px solid var(--border2);background:transparent;color:var(--txt3);font-size:11px;cursor:pointer;font-family:'Noto Sans KR',sans-serif">🗑 전체 초기화</button>
+  </div>
+  <!-- 메인 -->
+  <div class="main">
+    <div class="dl-bar show" id="dlBar">
+      <div class="dl-info" id="dlInfo">📊 <span>과거 85개 · 신규 7개</span></div>
+      <button class="btn-dl btn-dl-past" id="btnDlPast" onclick="downloadExcel('past')">⬇ 과거 스타일DB</button>
+      <button class="btn-dl btn-dl-new" id="btnDlNew" onclick="downloadExcel('new')">⬇ 신규 스타일DB</button>
+      <button class="btn-dl btn-dl-past" id="btnDlAll" onclick="downloadExcel('all')" style="background:linear-gradient(135deg,var(--acc),var(--acc2));color:#fff">⬇ 전체</button>
+    </div>
+    <div id="resultArea"><div class="tbl-wrap"><table class="tbl"><thead><tr><th>style_id</th><th>style_name</th><th>시즌</th><th>아이템</th><th>성별</th><th>소재</th><th>핏</th><th>디자인1</th><th>디자인2</th><th>그래픽</th><th>메모</th></tr></thead><tbody><tr><td class="mono" data-type="new" data-idx="0" data-col="sid" onblur="editCell(this)">14580-020-601-09</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="name" onblur="editCell(this)">B)COTTON CHECK SHIRTS</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="item" onblur="editCell(this)">셔츠</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="material" onblur="editCell(this)">COTTON</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="design1" onblur="editCell(this)">포켓</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="design2" onblur="editCell(this)">없음</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="graphic" onblur="editCell(this)">체크</td><td class="sm" contenteditable="true" data-type="new" data-idx="0" data-col="memo" onblur="editCell(this)">C100 150G 3COLOR CHECK YARN DYED SOFT WASHING, 인터라이닝(칼라/커프스/프론트오픈/포켓), 컬러2종(NAVY 097 / BROWN 185), 140SIZE 기준, SAME AS 14530-020-603-09 QUALITY</td></tr><tr><td class="mono" data-type="new" data-idx="1" data-col="sid" onblur="editCell(this)">14580-020-602-10</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="name" onblur="editCell(this)">B)W. WASHED DENIM SHIRTS</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="item" onblur="editCell(this)">셔츠</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="material" onblur="editCell(this)">DENIM</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="design1" onblur="editCell(this)">포켓</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="design2" onblur="editCell(this)">스냅</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="graphic" onblur="editCell(this)">없음</td><td class="sm" contenteditable="true" data-type="new" data-idx="1" data-col="memo" onblur="editCell(this)">후드 삭제(05/27 업데이트), BIO STONE(SOFT)/SAND(BRUSH) 워싱, 인디고(SF4505 C/P/SP 91/7/2 9.3oz) 및 블랙(SF4473 C/P/R/SP 57/29/12/2 9oz) 2가지 원단, 140사이즈 기준</td></tr><tr><td class="mono" data-type="new" data-idx="2" data-col="sid" onblur="editCell(this)">14580-031-601-31</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="name" onblur="editCell(this)">B)K. PIGMENT GRAPHIC T-SHIRT</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="item" onblur="editCell(this)">티셔츠/후드티/맨투맨</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="material" onblur="editCell(this)">COTTON</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="design1" onblur="editCell(this)">프린트</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="design2" onblur="editCell(this)">없음</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="graphic" onblur="editCell(this)">그래픽</td><td class="sm" contenteditable="true" data-type="new" data-idx="2" data-col="memo" onblur="editCell(this)">GARMENT OVER DYE + ACID WASH / ANTI-PILLING / 넥 바인딩 1.8cm 2*1 LYCRA RIB DOUBLE SPAN RIB / 14570-031-428-31과 워싱기법 동일 적용</td></tr><tr><td class="mono" data-type="new" data-idx="3" data-col="sid" onblur="editCell(this)">14580-031-602-31</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="name" onblur="editCell(this)">B) K. COTTON GRAPHIC T-SHIRTS</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="item" onblur="editCell(this)">티셔츠/후드티/맨투맨</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="material" onblur="editCell(this)">COTTON</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="design1" onblur="editCell(this)">프린트</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="design2" onblur="editCell(this)">없음</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="graphic" onblur="editCell(this)">로고</td><td class="sm" contenteditable="true" data-type="new" data-idx="3" data-col="memo" onblur="editCell(this)">C 100% 180G ANTI-PILLING ANTI-PILLING(MELANGE), DOUBLE CHAIN ST, NECK BODY FABRIC 18MM 2FOLD, HIGH DENSITY PRINT(1C), 3color(O/WHITE/BROWN/BLACK), SAME AS QUALITY: 14570-031-439-31</td></tr><tr><td class="mono" data-type="new" data-idx="4" data-col="sid" onblur="editCell(this)">14580-031-603-31</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="name" onblur="editCell(this)">B)K. STRIPE T-SHIRTS</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="item" onblur="editCell(this)">티셔츠/후드티/맨투맨</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="material" onblur="editCell(this)">KNIT</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="design1" onblur="editCell(this)">배색</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="design2" onblur="editCell(this)">없음</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="graphic" onblur="editCell(this)">스트라이프</td><td class="sm" contenteditable="true" data-type="new" data-idx="4" data-col="memo" onblur="editCell(this)">SAME AS STYLE: 14570-031-429-31 / 넥: 1x1 SPAN RIB 300G ANTI-PILLING / 숄더 TPU 5mm 테이프 / 백넥 10mm 바인딩 / 밑단 20mm 더블 체인스티치 / 컬러웨이: IVORY(025), S/BLUE(273)</td></tr><tr><td class="mono" data-type="new" data-idx="5" data-col="sid" onblur="editCell(this)">14580-031-604-31</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="name" onblur="editCell(this)">B)K.P/C/SP BENNY RUBBER WAPPEN T-SHIRT</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="item" onblur="editCell(this)">티셔츠/후드티/맨투맨</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="material" onblur="editCell(this)">P/C/SP</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="design1" onblur="editCell(this)">프린트</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="design2" onblur="editCell(this)">없음</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="graphic" onblur="editCell(this)">캐릭터</td><td class="sm" contenteditable="true" data-type="new" data-idx="5" data-col="memo" onblur="editCell(this)">투명 러버 와펜 부착, 55/42/3 200G ANTI-PILLING(MELANGE) 소재, 4컬러(O/WHITE/BLUE/D.GRAY/BLACK), 26FW 시즌</td></tr><tr><td class="mono" data-type="new" data-idx="6" data-col="sid" onblur="editCell(this)">14580-031-605-09</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="name" onblur="editCell(this)">B) K.C/P DOUBLE FACE 3COL YARN DYDE COLLAR TEE</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="season" onblur="editCell(this)">FALL</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="item" onblur="editCell(this)">티셔츠/후드티/맨투맨</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="gender" onblur="editCell(this)">남성</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="material" onblur="editCell(this)">D.FACE</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="fit" onblur="editCell(this)">레귤러</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="design1" onblur="editCell(this)">배색</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="design2" onblur="editCell(this)">프린트</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="graphic" onblur="editCell(this)">텍스트</td><td class="sm" contenteditable="true" data-type="new" data-idx="6" data-col="memo" onblur="editCell(this)">DOUBLE FACE C/P 80/20 210G ANTI-PILLING / 3COL YARN DYED STRIPE / RUBBER PRINT 1C / 2*1 SPAN RIB CUFF / HERRINGBONE TAPE 내부 / 컬러: NAVY(097), GREEN(319)</td></tr></tbody></table></div></div>
+  </div>
+</div>
+
+<script>
+
+const SEASON_MAP   = {'2':'SPRING','4':'SUMMER','6':'FALL','8':'WINTER'};
+const GENDER_DIGIT = {'0':'남성','1':'여성'};
+const ITEM_DIGITS  = {'10':'자켓/점퍼','20':'셔츠','31':'티셔츠/후드티/맨투맨','34':'집업','37':'숏팬츠','38':'팬츠','50':'팬츠','55':'데님팬츠','56':'데님숏팬츠'};
+const HEADERS = ['style_id','style_name','시즌','아이템','성별','소재','핏','디자인1','디자인2','그래픽','메모'];
+const COLS    = ['sid','name','season','item','gender','material','fit','design1','design2','graphic','memo'];
+
+let PAST_DB = [{"sid": "14530-010-603-10", "name": "B)C/P/SP HOOD DETACHABLE DENIM TRUCKER", "season": "FALL", "item": "자켓/점퍼", "gender": "남성", "material": "DENIM", "fit": "레귤러", "design1": "후드탈착", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-020-601-21", "name": "COTTON POLY OXFORD SHIRTS", "season": "FALL", "item": "셔츠", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-020-602-10", "name": "B) C/P/SP DENIM SHIRKET", "season": "FALL", "item": "셔츠", "gender": "남성", "material": "DENIM", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-020-603-09", "name": "COTTON CHECK SHIRTS", "season": "FALL", "item": "셔츠", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-020-604-09", "name": "COTTON CHECK SHIRTS", "season": "FALL", "item": "셔츠", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-020-605-09", "name": "COTTON PRINTING CHECK SHIRTS", "season": "FALL", "item": "셔츠", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "체크", "design2": "포켓", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-020-606-68", "name": "SEERSUCKER CHECK SHIRTS", "season": "FALL", "item": "셔츠", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-031-601-07", "name": "DOUBLE FACE SMALL BENNY BOLD STRIPE COLLAR T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "KNIT", "fit": "레귤러", "design1": "자수", "design2": "버튼", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-031-603-31", "name": "B) PCSP SMALL LETTER SINGLE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "JERSEY", "fit": "레귤러", "design1": "프린트", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-031-604-07", "name": "C/P NUMBER BIG GRAPHIC T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "프린트", "design2": "없음", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-031-607-31", "name": "CP HALFTONE DOTS PRINT T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "COTTON", "fit": "오버핏", "design1": "프린트", "design2": "없음", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-031-608-31", "name": "DOUBLE FACE BASIC MTM", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "없음", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-031-609-31", "name": "C/P MULTI STRIPE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "KNIT", "fit": "레귤러", "design1": "배색", "design2": "없음", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-031-611-31", "name": "B) P/C/SP SOLID SHORT SLEEVE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "JERSEY", "fit": "오버핏", "design1": "없음", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-031-612-31", "name": "B) P/C/SP BIG GRAPHIC SHORT SLEEVE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "JERSEY", "fit": "레귤러", "design1": "프린트", "design2": "없음", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-031-613-15", "name": "C/P MULTI STRIPE SHORT SLEEVE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "자수", "design2": "배색", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-031-614-31", "name": "B) C/P DOUBLE FACE 3COL YARN DYDE COLLAR TEE", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "KNIT", "fit": "레귤러", "design1": "배색", "design2": "버튼", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-031-615-15", "name": "C/P MULTI STRIPE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "JERSEY", "fit": "레귤러", "design1": "배색", "design2": "자수", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-031-616-07", "name": "B) DOUBLE FACE CAMOUFLAGE GRAPHIC MTM", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "프린트", "design2": "없음", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-031-617-15", "name": "COTTON SMALL LOGO MULTI STRIPE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "프린트", "design2": "배색", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-031-651-07", "name": "B) DOUBLE FACE BENNY MTM", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "프린트", "design2": "없음", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-031-652-07", "name": "DOUBLE FACE HGTN BIG LOGO MTM", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "프린트", "design2": "배색", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-031-653-07", "name": "DOUBLE FACE SMALL BENNY HOODY", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "자수", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-034-601-07", "name": "DOUBLE FACE BASIC HOOD ZIP-UP", "season": "FALL", "item": "집업", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "집업", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-037-601-07", "name": "B) DOUBLE FACE 7L BERMUDA TUCK PANTS", "season": "FALL", "item": "숏팬츠", "gender": "남성", "material": "KNIT", "fit": "레귤러", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-037-602-07", "name": "DOUBLE FACE 6L CARGO BERMUDA PANTS", "season": "FALL", "item": "숏팬츠", "gender": "남성", "material": "KNIT", "fit": "레귤러", "design1": "포켓", "design2": "벨크로", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-604-07", "name": "DOUBLE FACE CARGO WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "WOVEN", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-605-41", "name": "NYLON SPAN CARGO JOGGER PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "NYLON", "fit": "레귤러", "design1": "포켓", "design2": "프린트", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-606-41", "name": "NYLON SPAN CARGO WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "NYLON", "fit": "와이드", "design1": "포켓", "design2": "프린트", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-651-07", "name": "DOUBLE FACE JOGGER PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "FLEECE", "fit": "레귤러", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-652-07", "name": "DOUBLE FACE CARGO JOGGER PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "KNIT", "fit": "레귤러", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-653-07", "name": "DOUBLE FACE SEMI-WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "KNIT", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-601-31", "name": "P/C/SPAN CARGO JOGGER PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "WOVEN", "fit": "레귤러", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-602-07", "name": "DOUBLE FACE ONE TUCK WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "KNIT", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-038-603-31", "name": "B) P/C/SP STRAIGHT PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "WOVEN", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-050-601-09", "name": "COTTON FULL BANDING CAMOUFLAGE CARGO WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "COTTON", "fit": "와이드", "design1": "포켓", "design2": "프린트", "graphic": "카모", "memo": "", "type": "past"}, {"sid": "14530-050-602-09", "name": "CAMOUFLAGE CARGO BERMUDA PANTS", "season": "FALL", "item": "팬츠", "gender": "남성", "material": "COTTON", "fit": "레귤러", "design1": "포켓", "design2": "프린트", "graphic": "카모", "memo": "", "type": "past"}, {"sid": "14530-055-601-10", "name": "B) C/P/SP FULL BANDING SEMI WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "남성", "material": "DENIM", "fit": "와이드", "design1": "밴딩", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-055-602-10", "name": "C/P/SP FULL BANDING COMFORT DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "남성", "material": "DENIM", "fit": "레귤러", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-055-603-10", "name": "C/P/SP OPEN CARPENTER WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "남성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-055-604-10", "name": "C/P/SP FULL BANDING CARGO WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "남성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-055-605-10", "name": "C/P/SP FULL BANDING TAPERED DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "남성", "material": "DENIM", "fit": "레귤러", "design1": "밴딩", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-055-606-10", "name": "C/P/SP FULL BANDING BALLOON DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "남성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-056-602-10", "name": "B) C/SP FULL BANDING 6L BERMUDA DENIM PANTS", "season": "FALL", "item": "데님숏팬츠", "gender": "남성", "material": "DENIM", "fit": "레귤러", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-110-601-46", "name": "G) P/SP TRACK TOP", "season": "FALL", "item": "자켓/점퍼", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "배색", "design2": "자수", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-110-602-05", "name": "G)NYLON GOLSSY HALF NECK JUMPER", "season": "FALL", "item": "자켓/점퍼", "gender": "여성", "material": "NYLON", "fit": "레귤러", "design1": "집업", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-120-601-21", "name": "G) CP OXFORD SHIRTS", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "WOVEN", "fit": "레귤러", "design1": "자수", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-120-602-10", "name": "G) C/P/SP DENIM SHIRKET", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "DENIM", "fit": "레귤러", "design1": "포켓", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-120-603-09", "name": "G) CHECK HOOD SHIRKET", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "COTTON", "fit": "레귤러", "design1": "후드", "design2": "체크", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-120-604-09", "name": "G) T/R CHECK HOOD SHIRKET", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "WOVEN", "fit": "레귤러", "design1": "후드탈착", "design2": "버튼", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-120-606-09", "name": "G)COTTON CHECK SHIRTS", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "COTTON", "fit": "레귤러", "design1": "버튼", "design2": "없음", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-120-641-45", "name": "CHECK SHIRT", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "WOVEN", "fit": "레귤러", "design1": "버튼", "design2": "없음", "graphic": "체크", "memo": "", "type": "past"}, {"sid": "14530-120-642-45", "name": "G) STRIPE SHIRT", "season": "FALL", "item": "셔츠", "gender": "여성", "material": "WOVEN", "fit": "레귤러", "design1": "버튼", "design2": "없음", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-601-07", "name": "G) DOUBLE FACE FRONT BIG LETTERING FLOCKING YOKO V-NECK MTM", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "FLEECE", "fit": "레귤러", "design1": "프린트", "design2": "배색", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-131-603-31", "name": "G) CP FRONT BIG LETTERING LONG SLEEVE T-SHIRT", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "COTTON", "fit": "레귤러", "design1": "프린트", "design2": "없음", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-131-604-31", "name": "G) PCSPAN BENNY LONG SLEEVE T-SHIRT", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "JERSEY", "fit": "레귤러", "design1": "자수", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-131-606-15", "name": "G) T/R/SP WALE STRIPE T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "배색", "design2": "없음", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-607-15", "name": "G) T/R/SP WALE HENLEY NECK LAYERED T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "버튼", "design2": "배색", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-131-611-05", "name": "G) T/R/SP 71/22/7 280G LAYERED CADIGAN", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "버튼", "design2": "배색", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-612-05", "name": "G) T/R/SP WALE NENLEY NECK T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "버튼", "design2": "자수", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-613-05", "name": "G) WALE LAYERED T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "배색", "design2": "버튼", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-618-05", "name": "G) WALE HENLEY NECK SNAP HOOD", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "스냅", "design2": "포켓", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-619-05", "name": "WALE STRIPE LAYERED CADIGAN", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "배색", "design2": "버튼", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-620-05", "name": "G) KNIT LIKE HENLEY NECK SNAP HOOD", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "스냅", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-131-642-31", "name": "STRIPE LAYERED T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "COTTON", "fit": "레귤러", "design1": "버튼", "design2": "배색", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-131-652-07", "name": "G) DOUBLE FACE FRONT BENNY SERIES MTM", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "FLEECE", "fit": "레귤러", "design1": "프린트", "design2": "배색", "graphic": "그래픽", "memo": "", "type": "past"}, {"sid": "14530-131-653-31", "name": "G) P/C/SP FRONT SMALL LETTERING LAYERED BUSTIER T-SHIRTS", "season": "FALL", "item": "티셔츠/후드티/맨투맨", "gender": "여성", "material": "JERSEY", "fit": "레귤러", "design1": "프린트", "design2": "버튼", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-134-601-31", "name": "G) KNIT LIKE HOOD ZIP UP", "season": "FALL", "item": "집업", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "집업", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-134-602-31", "name": "G) COTTON /SPAN STRIPE HOOD ZIP UP", "season": "FALL", "item": "집업", "gender": "여성", "material": "COTTON", "fit": "레귤러", "design1": "집업", "design2": "포켓", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-134-603-31", "name": "G) KNIT LIKE STRIPE HOOD ZIP UP", "season": "FALL", "item": "집업", "gender": "여성", "material": "KNIT", "fit": "레귤러", "design1": "집업", "design2": "포켓", "graphic": "스트라이프", "memo": "", "type": "past"}, {"sid": "14530-138-601-07(1)", "name": "G) DOUBLE FACE JERSEY WIDE JOGGER PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "JERSEY", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-138-602-07", "name": "G) DOUBLE FACE JERSEY ONE TUCK WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "JERSEY", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-138-603-07(2)", "name": "DOUBLE FACE JERSEY SIDE TUCK WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "JERSEY", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-138-604-46", "name": "G) P/SP TRACK WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "JERSEY", "fit": "와이드", "design1": "배색", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-138-605-07", "name": "G) P/C DOUBLE FACE WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "KNIT", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-138-652-07", "name": "G) DOUBLE FACE JERSEY SEMI-WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "JERSEY", "fit": "와이드", "design1": "포켓", "design2": "없음", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-138-653-31", "name": "P/C/SPAN JERSEY WIDE PANTS", "season": "FALL", "item": "팬츠", "gender": "여성", "material": "JERSEY", "fit": "와이드", "design1": "포켓", "design2": "스트링", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-601-10", "name": "C/P/SP FULL BANDING SEMI WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-602-10", "name": "G) C/P/SP FULL BANDING STRAIGHT DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "레귤러", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-603-10", "name": "C/P/SP FULL BANDING WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-604-10", "name": "G) C/P/SP OPEN WAIST SIDE TUCK TRANSFORM WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-605-10", "name": "C/P/SP FULL BANDING CARGO WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-606-10", "name": "G) C/P/SP FULL BANDING CUTTING LINE WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-607-10", "name": "C/P/SP FRONT TUCK BOTTOM SNAP TRANSFORM WIDE DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "스냅", "design2": "포켓", "graphic": "없음", "memo": "", "type": "past"}, {"sid": "14530-155-608-10", "name": "C/P/SP FULL BANDING BALLOON DENIM PANTS", "season": "FALL", "item": "데님팬츠", "gender": "여성", "material": "DENIM", "fit": "와이드", "design1": "포켓", "design2": "스냅", "graphic": "없음", "memo": "", "type": "past"}];
+let NEW_DB  = [];
+let curTab  = 'past';
+
+function switchTab(t){
+  curTab=t;
+  document.getElementById('tabPast').className='tab'+(t==='past'?' on':'');
+  document.getElementById('tabNew').className='tab'+(t==='new'?' on-new':'');
+  document.getElementById('panePast').style.display=t==='past'?'':'none';
+  document.getElementById('paneNew').style.display=t==='new'?'':'none';
+  renderTable();
+}
+
+// ── 드롭/업로드 ──────────────────────────────────────────────────
+function handleDrop(e,type){
+  e.preventDefault();
+  document.getElementById(type==='past'?'dropPast':'dropNew').classList.remove('drag');
+  handleFiles(e.dataTransfer.files,type);
+}
+
+async function handleFiles(files,type){
+  const pdfs=Array.from(files).filter(f=>f.name.match(/\.pdf$/i));
+  if(!pdfs.length){showSt(type==='past'?'stPast':'stNew','err','❌ PDF 파일만 지원합니다.');return;}
+  const progId=type==='past'?'progPast':'progNew';
+  const stId  =type==='past'?'stPast':'stNew';
+  showSt(stId,'loading','⏳ '+pdfs.length+'개 분석 중...');
+  document.getElementById(progId).style.width='0%';
+  for(let i=0;i<pdfs.length;i++){
+    const f=pdfs[i];
+    addFileItem(f.name,type,'ing','분석 중...');
+    try{
+      const r=await extractFromPdf(f,type);
+      if(type==='past'){PAST_DB=PAST_DB.filter(d=>d.sid!==r.sid);PAST_DB.push(r);}
+      else{NEW_DB=NEW_DB.filter(d=>d.sid!==r.sid);NEW_DB.push(r);}
+      updateFileItem(f.name,type,'ok','완료');
+    }catch(e){
+      updateFileItem(f.name,type,'err','실패');
+      console.error(f.name,e);
+    }
+    document.getElementById(progId).style.width=((i+1)/pdfs.length*100)+'%';
+  }
+  renderTable();updateDlBar();updateBadges();
+  showSt(stId,'ok','✅ '+pdfs.length+'개 완료');
+  setTimeout(()=>document.getElementById(progId).style.width='0%',2000);
+}
+
+// ── PDF → Claude API ─────────────────────────────────────────────
+async function extractFromPdf(file,type){
+  const b64=await fileToBase64(file);
+  const prompt=`이 작업지시서 PDF에서 정보를 추출하세요.
+스타일코드: 브랜드-②아이템코드-③시즌코드-연도 (예:14530-010-603-10)
+  ② 첫자리: 0=남성 1=여성 / 두세번째: 10=자켓/점퍼 20=셔츠 31=티셔츠/후드티/맨투맨 34=집업 37=숏팬츠 38=팬츠 55=데님팬츠 56=데님숏팬츠
+  ③ 첫자리: 2=SPRING 4=SUMMER 6=FALL 8=WINTER
+JSON만 반환:
+{"style_id":"","style_name":"STYLE DES 전체","season":"SPRING/SUMMER/FALL/WINTER(③첫자리 우선)","item":"자켓/점퍼/후드티/팬츠/티셔츠/스커트/원피스/코트/베스트/맨투맨/셔츠/니트/집업/숏팬츠/데님팬츠/데님숏팬츠 중","gender":"여성/남성/공용(②첫자리 우선)","material":"메인소재(DENIM/FLEECE/NEOTERRY/COTTON/NYLON/KNIT/WOVEN/POLAR/P/C/SP/D.FACE/JERSEY등)","fit":"오버핏/레귤러/슬림/와이드/조거/스트레이트/세미와이드 중","design1":"디자인포인트1(후드탈착/배색/포켓/집업/스냅/프린트/자수/밴딩/카고/없음)","design2":"디자인포인트2(없으면 없음)","graphic":"그래픽(없음/로고/캐릭터/텍스트/체크/스트라이프/카모/그래픽 중)","memo":"특이사항(없으면 빈문자열)"}`;
+  const resp=await fetch('https://api.anthropic.com/v1/messages',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,
+      messages:[{role:'user',content:[
+        {type:'document',source:{type:'base64',media_type:'application/pdf',data:b64}},
+        {type:'text',text:prompt}
+      ]}]})
+  });
+  if(!resp.ok) throw new Error('API '+resp.status);
+  const data=await resp.json();
+  const p=JSON.parse(data.content.map(b=>b.text||'').join('').replace(/```json|```/g,'').trim());
+  const parts=(p.style_id||'').split('-');
+  const c2=parts[1]||'',c3=parts[2]||'';
+  return {
+    sid:    p.style_id||file.name.replace('.pdf',''),
+    name:   p.style_name||'',
+    season: SEASON_MAP[(c3[0]||'')] || p.season||'',
+    item:   ITEM_DIGITS[(c2.slice(1))||''] || p.item||'',
+    gender: GENDER_DIGIT[(c2[0]||'')] || p.gender||'공용',
+    material:p.material||'',fit:p.fit||'',
+    design1:p.design1||'없음',design2:p.design2||'없음',
+    graphic:p.graphic||'없음',memo:p.memo||'',type:type
+  };
+}
+function fileToBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=()=>rej(new Error('읽기 실패'));r.readAsDataURL(file);});}
+
+// ── 테이블 렌더링 ────────────────────────────────────────────────
+function renderTable(){
+  const area=document.getElementById('resultArea');
+  const data=curTab==='past'?PAST_DB:NEW_DB;
+  const accentCol=curTab==='past'?'var(--acc)':'var(--acc2)';
+  if(!data.length){
+    area.innerHTML='<div class="empty"><div class="empty-icon">'+(curTab==='past'?'📁':'🆕')+'</div><div style="font-size:13px">'+(curTab==='past'?'과거':'신규')+' WO PDF를 업로드하세요</div></div>';
+    return;
+  }
+  let html='<div class="tbl-wrap"><table class="tbl"><thead><tr>';
+  HEADERS.forEach(h=>{html+='<th>'+h+'</th>';});
+  html+='</tr></thead><tbody>';
+  data.forEach((d,i)=>{
+    html+='<tr>';
+    COLS.forEach((col,ci)=>{
+      const ed=ci>0?'contenteditable="true"':'';
+      const cls=ci===0?'mono':'sm';
+      html+=`<td class="${cls}" ${ed} data-type="${curTab}" data-idx="${i}" data-col="${col}" onblur="editCell(this)">${d[col]||''}</td>`;
+    });
+    html+='</tr>';
+  });
+  html+='</tbody></table></div>';
+  area.innerHTML=html;
+}
+function editCell(el){
+  const type=el.dataset.type,idx=parseInt(el.dataset.idx),col=el.dataset.col;
+  const arr=type==='past'?PAST_DB:NEW_DB;
+  if(arr[idx]) arr[idx][col]=el.textContent.trim();
+}
+
+// ── 파일 목록 ────────────────────────────────────────────────────
+function addFileItem(name,type,status,msg){
+  const listId=type==='past'?'listPast':'listNew';
+  const list=document.getElementById(listId);
+  if(list.children.length===1&&list.children[0].tagName!=='DIV'.toUpperCase()||
+     (list.children[0]&&list.children[0].className===''))list.innerHTML='';
+  // 첫 항목이 "없음" 텍스트면 제거
+  if(list.children.length===1&&!list.children[0].className){list.innerHTML='';}
+  const id='fi-'+type+'-'+name.replace(/[\.\s]/g,'_');
+  if(document.getElementById(id)){document.getElementById(id).querySelector('span').textContent=msg;return;}
+  const el=document.createElement('div');el.className='file-item';el.id=id;
+  el.innerHTML=`<div class="fi-name" title="${name}">${name}</div><span class="fi-${status}">${msg}</span>`;
+  list.appendChild(el);
+  document.getElementById(type==='past'?'cntPastFiles':'cntNewFiles').textContent=list.children.length+'개';
+}
+function updateFileItem(name,type,status,msg){
+  const el=document.getElementById('fi-'+type+'-'+name.replace(/[\.\s]/g,'_'));
+  if(!el)return;const s=el.querySelector('span');s.className='fi-'+status;s.textContent=msg;
+}
+
+// ── 다운로드 바 & 뱃지 ───────────────────────────────────────────
+function updateDlBar(){
+  const bar=document.getElementById('dlBar');
+  const hasPast=PAST_DB.length>0,hasNew=NEW_DB.length>0;
+  if(!hasPast&&!hasNew){bar.classList.remove('show');return;}
+  bar.classList.add('show');
+  document.getElementById('dlInfo').innerHTML='📊 <span>과거 '+PAST_DB.length+'개 · 신규 '+NEW_DB.length+'개</span>';
+  document.getElementById('btnDlPast').disabled=!hasPast;
+  document.getElementById('btnDlNew').disabled=!hasNew;
+  document.getElementById('btnDlAll').disabled=!(hasPast||hasNew);
+}
+function updateBadges(){
+  document.getElementById('pastBadge').textContent='과거 '+PAST_DB.length+'개';
+  document.getElementById('newBadge').textContent='신규 '+NEW_DB.length+'개';
+}
+
+// ── 엑셀 다운로드 ────────────────────────────────────────────────
+function downloadExcel(mode){
+  if(!window.XLSX){alert('SheetJS 로딩 중입니다.');return;}
+  const wb=XLSX.utils.book_new();
+  const cw=[{wch:22},{wch:38},{wch:8},{wch:20},{wch:7},{wch:12},{wch:10},{wch:14},{wch:14},{wch:12},{wch:25}];
+  function makeSheet(arr){
+    const rows=[HEADERS];
+    arr.forEach(d=>rows.push([d.sid,d.name,d.season,d.item,d.gender,d.material,d.fit,d.design1,d.design2,d.graphic,d.memo]));
+    const ws=XLSX.utils.aoa_to_sheet(rows);ws['!cols']=cw;return ws;
+  }
+  if(mode!=='new'&&PAST_DB.length) XLSX.utils.book_append_sheet(wb,makeSheet(PAST_DB),'스타일DB');
+  if(mode!=='past'&&NEW_DB.length)  XLSX.utils.book_append_sheet(wb,makeSheet(NEW_DB),'신규스타일DB');
+  if(!wb.SheetNames.length){alert('저장할 데이터가 없습니다.');return;}
+  const ymd=new Date().toISOString().slice(0,10).replace(/-/g,'');
+  const fname=(mode==='past'?'past_':mode==='new'?'new_':'all_')+'styledb_'+ymd+'.xlsx';
+  try{
+    const out=XLSX.write(wb,{bookType:'xlsx',type:'array'});
+    const blob=new Blob([out],{type:'application/octet-stream'});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement('a');a.href=url;a.download=fname;
+    document.body.appendChild(a);a.click();
+    setTimeout(()=>{URL.revokeObjectURL(url);document.body.removeChild(a);},1000);
+    showSt('stPast','ok','✅ '+fname+' 다운로드 완료');
+  }catch(e){showSt('stPast','err','❌ '+e.message);}
+}
+
+// ── HTML 파일 저장 ────────────────────────────────────────────────
+function saveHtmlFile(){
+  let html=document.documentElement.outerHTML;
+  html=html.replace(/
+
+</body></html>
