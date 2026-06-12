@@ -1,3 +1,4 @@
+<!DOCTYPE html>
 <html lang="ko"><head>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
     <script>
@@ -1128,7 +1129,45 @@ function downloadExcel(mode){
 // ── HTML 저장 ─────────────────────────────────────────────────────
 function saveHtmlFile(){
   let html=document.documentElement.outerHTML;
-  html=html.replace(/
+  const pastJson=JSON.stringify(PAST_DB.map(d=>({...d,type:'past'})));
+  const newJson=JSON.stringify(NEW_DB.map(d=>({...d,type:'new'})));
+  html=html.replace(/(<script id="__sd__">)[\s\S]*?(<\/script>)/,
+    '$1window.__PAST__='+pastJson+';window.__NEW__='+newJson+';$2');
+  const blob=new Blob([html],{type:'text/html;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const ymd=new Date().toISOString().slice(0,10).replace(/-/g,'');
+  const a=document.createElement('a');a.href=url;a.download='wo_analyzer_'+ymd+'.html';
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);document.body.removeChild(a);},1000);
+  showSt('stPast','ok','✅ 파일 저장 완료');
+}
+
+function clearAll(){
+  if(!confirm('모든 데이터를 초기화하시겠습니까?')) return;
+  PAST_DB=[];NEW_DB=[];
+  renderResultTable();updateDlBar2();updateBadges2();
+  document.getElementById('listPast').innerHTML='';
+  document.getElementById('listNew').innerHTML='';
+  document.getElementById('storageInfo').textContent='💾 데이터 없음';
+  document.getElementById('sbDot').classList.remove('on');
+  showSt('stPast','ok','✅ 초기화 완료');
+}
+
+// ── 초기화: 내장 데이터 로드 ──────────────────────────────────────
+(function init(){
+  if(window.__PAST__&&window.__PAST__.length) PAST_DB=window.__PAST__;
+  if(window.__NEW__&&window.__NEW__.length) NEW_DB=window.__NEW__;
+  renderResultTable();updateDlBar2();updateBadges2();
+  if(PAST_DB.length||NEW_DB.length){
+    document.getElementById('storageInfo').textContent=
+      '💾 데이터 복원 완료 · 과거 '+PAST_DB.length+'개 · 신규 '+NEW_DB.length+'개';
+    document.getElementById('sbDot').classList.add('on');
+  }
+  switchPdfTab('new');
+})();
+</script>
+
+
 
 <div class="header">
   <div>
@@ -1228,8 +1267,7 @@ function saveHtmlFile(){
 
   </div>
 </div>
-
-
-
+</body>
+</html>
 
 </body></html>
